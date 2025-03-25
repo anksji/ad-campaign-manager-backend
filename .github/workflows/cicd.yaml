@@ -1,0 +1,223 @@
+name: Deploy Campaign-manager to VPS
+
+on:
+  push:
+    branches:
+      - production
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_BUILDKIT: 1
+      IMAGE_NAME: campaign-manager-backend
+      # Use a timestamped tag for versioning
+      IMAGE_TAG: ${{ github.sha }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      # Create the credentials directory and service account key file
+      - name: Create Firebase credentials
+        run: |
+          mkdir -p config/credentials
+          echo "${{ secrets.FIREBASE_SERVICE_ACCOUNT }}" | base64 -d > config/credentials/serviceAccountKey.json
+          mkdir -p src/config/credentials
+          cp config/credentials/serviceAccountKey.json src/config/credentials/
+
+      # Login to Docker Hub
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      # Build and push to Docker Hub
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }},${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          file: ./Dockerfile
+          build-args: |
+            FIREBASE_SERVICE_ACCOUNT=${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+      # Test SSH connection
+      - name: Test SSH Connection
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
+
+          # Test basic SSH connection (no file transfer)
+          ssh -i ~/.ssh/id_rsa ${{ secrets.VPS_USERNAME }}@${{ secrets.VPS_HOST }} "echo Connection successful && df -h"
+
+      # Deploy using Docker Hub image
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            echo "====== Starting Deployment ======"
+            echo "Time: $(date)"
+
+            # Clean up Docker resources to free space
+            docker system prune -af --volumes || true
+
+            # Create project directory
+            mkdir -p ~/campaign-manager-backend
+            cd ~/campaign-manager-backend
+
+            # Create serviceAccountKey.json file directly on the VPS
+            mkdir -p config/credentials
+            echo "${{ secrets.FIREBASE_SERVICE_ACCOUNT }}" | base64 -d > config/credentials/serviceAccountKey.json
+            chmod 600 config/credentials/serviceAccountKey.json
+
+            # Backup existing env file if it exists
+            if [ -f .env ]; then
+              mv .env .env.backup.$(date +%Y%m%d%H%M%S)
+            fi
+
+            # Create .env file 
+            cat > .env << 'EOL'
+            MONGODB_CONNECTION_STRING=${{ secrets.MONGODB_CONNECTION_STRING }}
+            API_VERSION=${{ secrets.API_VERSION }}
+            PORT=3001
+            NODE_ENV=production
+            # Redis configuration
+            REDIS_HOST=redis
+            REDIS_PORT=6379
+            REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
+            REDIS_DB=0
+            EOL
+
+            chmod 600 .env
+
+            # Create docker-compose file
+            cat > docker-compose.yml << EOL
+            version: "3.8"
+
+            services:
+              api:
+                image: ${{ secrets.DOCKERHUB_USERNAME }}/campaign-manager-backend:${{ env.IMAGE_TAG }}
+                container_name: campaign-manager-backend
+                restart: unless-stopped
+                ports:
+                  - "127.0.0.1:3001:3001"
+                environment:
+                  - NODE_ENV=production
+                  - PORT=3001
+                  - NODE_OPTIONS=--max-old-space-size=768
+                env_file:
+                  - .env
+                networks:
+                  - campaign-manager-network
+                depends_on:
+                  - redis
+                volumes:
+                  - ./config/credentials/serviceAccountKey.json:/app/build/config/credentials/serviceAccountKey.json:ro
+                deploy:
+                  resources:
+                    limits:
+                      memory: 600M
+                healthcheck:
+                  test: ["CMD", "wget", "-q", "--spider", "http://localhost:3001/api/v1/apiHealth"]
+                  interval: 30s
+                  timeout: 10s
+                  retries: 3
+
+              redis:
+                image: redis:7-alpine
+                container_name: campaign-manager-redis
+                command: redis-server --requirepass "${{ secrets.REDIS_PASSWORD }}" --maxmemory 256mb --maxmemory-policy allkeys-lru
+                volumes:
+                  - campaign-manager-redis-data:/data
+                networks:
+                  - campaign-manager-network
+                deploy:
+                  resources:
+                    limits:
+                      memory: 300M
+                restart: unless-stopped
+                healthcheck:
+                  test: ["CMD", "redis-cli", "-a", "${{ secrets.REDIS_PASSWORD }}", "ping"]
+                  interval: 30s
+                  timeout: 10s
+                  retries: 3
+
+            volumes:
+              campaign-manager-redis-data:
+                driver: local
+
+            networks:
+              campaign-manager-network:
+                driver: bridge
+            EOL
+
+            # Pull the Docker image
+            echo "Pulling Docker image..."
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/campaign-manager-backend:${{ env.IMAGE_TAG }}
+
+            # Stop and remove existing containers
+            echo "Stopping existing containers..."
+            docker-compose down || true
+            docker stop campaign-manager-backend || true
+            docker rm campaign-manager-backend || true
+            docker stop campaign-manager-redis || true
+            docker rm campaign-manager-redis || true
+
+            # Start the new containers
+            echo "Starting containers..."
+            docker-compose up -d
+
+            # Verify deployment with incremental retries
+            echo "Verifying deployment..."
+            for i in {1..5}; do
+              echo "Verification attempt $i/5..."
+              sleep $((i * 5))
+              
+              if [ "$(docker ps -q -f name=campaign-manager-backend)" ]; then
+                echo "✅ Backend container is running"
+                if [ "$(docker ps -q -f name=campaign-manager-redis)" ]; then
+                  echo "✅ Redis container is running"
+                  if curl -sf http://localhost:3001/api/v1/apiHealth > /dev/null; then
+                    echo "✅ Application is healthy"
+                    echo "✅ Deployment successful!"
+                    docker logs campaign-manager-backend | tail -n 30
+                    
+                    # Clean up unused Docker resources
+                    echo "Cleaning up Docker resources..."
+                    docker image prune -f
+                    
+                    echo "====== Deployment Complete ======"
+                    echo "Completed at: $(date)"
+                    exit 0
+                  fi
+                fi
+              fi
+              
+              # If we reach here, something failed - show logs
+              echo "⚠️ Verification incomplete, checking again..."
+            done
+
+            # If we get here, the verification failed after all attempts
+            echo "❌ Deployment verification failed"
+            echo "Backend container status:"
+            docker ps -a | grep campaign-manager-backend || echo "No backend container found"
+            echo "Backend logs:"
+            docker logs campaign-manager-backend || echo "No backend logs available"
+
+            echo "====== Deployment Failed ======"
+            echo "Failed at: $(date)"
+            exit 1
